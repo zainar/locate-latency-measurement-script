@@ -13,6 +13,16 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### Configuration (required before first run)
+
+The tool reads API credentials from `env_config.json`, which is not committed to the repo. Create it from the example:
+
+```bash
+cp env_config.example.json env_config.json
+```
+
+Edit `env_config.json` and replace `your_username` and `your_password` with your real API credentials for each environment you use. The REST client will cache an API token in `token.txt` after the first authenticate; both `env_config.json` and `token.txt` are gitignored and must not be committed.
+
 ## Getting the WebSocket URL
 
 1. Open ZaiNar web app in browser and log in
@@ -109,7 +119,7 @@ For most use cases this is acceptable, but be aware of this limitation when inte
 
 ## Environment Configuration
 
-Environments are configured in `env_config.json`:
+Environments are configured in `env_config.json` (see [Configuration](#configuration-required-before-first-run) above). The file defines:
 
 | Environment | API Endpoint |
 |-------------|--------------|
