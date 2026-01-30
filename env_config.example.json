@@ -1,0 +1,22 @@
+{
+  "dev": {
+    "base_url": "https://api.wifi-dev.zainar.net/pipeline/r/api/v2/client",
+    "username": "your_username",
+    "password": "your_password"
+  },
+  "int": {
+    "base_url": "https://api.wifi-int.zainar.net/pipeline/r/api/v2/client",
+    "username": "your_username",
+    "password": "your_password"
+  },
+  "prod-apac": {
+    "base_url": "https://api.wifi-prd-jpn.zainar.net/pipeline/r/api/v2/client",
+    "username": "your_username",
+    "password": "your_password"
+  },
+  "prod-us": {
+    "base_url": "https://api.wifi-prd-us.zainar.net/pipeline/r/api/v2/client",
+    "username": "your_username",
+    "password": "your_password"
+  }
+}
