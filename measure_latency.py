@@ -32,6 +32,7 @@ import argparse
 import asyncio
 import json
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -41,6 +42,68 @@ import socketio
 import websockets
 
 from rest_client import Rest, Config
+
+
+@dataclass
+class CollectedEvent:
+    """A single location event collected from a WebSocket."""
+    meas_id: str
+    system_name: str
+    latency_ms: float
+    loc_info: dict
+    raw_event: dict
+
+
+class EventCollector:
+    """Thread-safe collector for location events across multiple systems."""
+
+    def __init__(self):
+        self._events: dict[str, dict[str, CollectedEvent]] = {}  # meas_id -> {system_name -> event}
+        self._lock = asyncio.Lock()
+        self._counts: dict[str, int] = {}  # system_name -> total events seen
+
+    async def add_event(
+        self,
+        meas_id: str,
+        system_name: str,
+        latency_ms: float,
+        loc_info: dict,
+        raw_event: dict,
+        debug: bool = False
+    ) -> bool:
+        """
+        Add an event to the collection.
+
+        Returns True if added, False if duplicate meas_id for same system.
+        """
+        async with self._lock:
+            # Track total events per system
+            self._counts[system_name] = self._counts.get(system_name, 0) + 1
+
+            if meas_id not in self._events:
+                self._events[meas_id] = {}
+
+            if system_name in self._events[meas_id]:
+                if debug:
+                    print(f"  [{system_name}] [skip] duplicate meas_id={meas_id}")
+                return False
+
+            self._events[meas_id][system_name] = CollectedEvent(
+                meas_id=meas_id,
+                system_name=system_name,
+                latency_ms=latency_ms,
+                loc_info=loc_info,
+                raw_event=raw_event,
+            )
+            return True
+
+    def get_results(self) -> dict[str, dict[str, CollectedEvent]]:
+        """Return all collected events grouped by meas_id."""
+        return self._events
+
+    def get_event_counts(self) -> dict[str, int]:
+        """Return total event count per system."""
+        return self._counts
 
 
 def load_env_configs() -> dict:
@@ -238,23 +301,79 @@ def extract_location_from_event(event: dict) -> Optional[dict]:
     return None
 
 
+def extract_meas_id(event: dict, system_name: str, zlp_data: Optional[dict] = None) -> Optional[str]:
+    """
+    Extract meas_id from an event based on system type.
+
+    Args:
+        event: The raw event dict (for WiFi-Cloud and ILaaS)
+        system_name: "WiFi-Cloud", "ILaaS", or "ZLP"
+        zlp_data: The Socket.IO payload (only for ZLP)
+
+    Returns:
+        meas_id string or None if not found
+    """
+    if system_name == "WiFi-Cloud":
+        # Path: event.update.events.tracker.location.meas_id
+        loc = event.get("update", {}).get("events", {}).get("tracker", {}).get("location", {})
+        return loc.get("meas_id")
+
+    elif system_name == "ILaaS":
+        # Try root level first, then location sub-object
+        meas_id = event.get("meas_id")
+        if meas_id:
+            return str(meas_id)
+        loc = event.get("location", {})
+        if loc:
+            return loc.get("meas_id")
+        return None
+
+    elif system_name == "ZLP":
+        # Socket.IO payload: data.location.meas_id
+        if zlp_data:
+            loc = zlp_data.get("location", {})
+            meas_id = loc.get("meas_id")
+            if meas_id:
+                return str(meas_id)
+        return None
+
+    return None
+
+
 async def listen_for_location(
     name: str,
     websocket,
     system_id: str,
     t_trigger: float,
     timeout: float,
-    debug: bool
+    debug: bool,
+    collector: Optional[EventCollector] = None
 ) -> dict:
     """
-    Listen on an already-connected websocket for a location event matching system_id.
+    Listen on an already-connected websocket for location events matching system_id.
 
-    Returns: {"name": str, "latency_ms": float, "loc_info": dict}
-         or: {"name": str, "error": str} on timeout/failure
+    If collector is provided, collects ALL matching events until timeout.
+    Otherwise, returns on first match (legacy behavior).
+
+    Returns: {"name": str, "count": int} when collecting
+         or: {"name": str, "latency_ms": float, "loc_info": dict} (legacy single-event)
+         or: {"name": str, "error": str} on failure
     """
+    event_count = 0
+    deadline = time.perf_counter() + timeout
+    first_event_logged = False
+
     try:
         while True:
-            raw_message = await asyncio.wait_for(websocket.recv(), timeout=timeout)
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+
+            try:
+                raw_message = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+
             t_event = time.perf_counter()
 
             try:
@@ -264,39 +383,69 @@ async def listen_for_location(
                     print(f"  [{name}] [non-JSON] {raw_message[:100]}")
                 continue
 
+            # Debug: log full structure of first event
+            if debug and not first_event_logged:
+                print(f"  [{name}] [first-event-structure] {json.dumps(event, indent=2)[:500]}")
+                first_event_logged = True
+
             event_node_id = event.get("id", "")
             loc_info = extract_location_from_event(event)
 
             # Skip non-location events
             if loc_info is None:
                 if debug:
-                    # Show more detail for debugging different event formats
                     event_type = list(event.get("update", {}).get("events", {}).keys())
                     if not event_type:
-                        # Might be a different format entirely - show raw keys
                         print(f"  [{name}] [skip] keys={list(event.keys())[:5]} (unknown format)")
                     else:
                         print(f"  [{name}] [skip] node={event_node_id} type={event_type} (not a location event)")
                 continue
 
-            # Match by system_id (WiFi-Cloud uses event["id"]; ILaaS uses tagResName -> loc_info["node_id"])
+            # Match by system_id
             match_id = event_node_id or loc_info.get("node_id", "")
             if debug:
-                print(f"  [{name}] [event] node={match_id} loc=({loc_info['x']:.1f}, {loc_info['y']:.1f})")
+                meas_id = extract_meas_id(event, name)
+                print(f"  [{name}] [event] node={match_id} meas_id={meas_id} loc=({loc_info['x']:.1f}, {loc_info['y']:.1f})")
 
             if match_id != system_id:
                 continue
 
             latency_ms = (t_event - t_trigger) * 1000
+
+            # Collection mode: add to collector and continue
+            if collector is not None:
+                meas_id = extract_meas_id(event, name)
+                if meas_id is None:
+                    if debug:
+                        print(f"  [{name}] [skip] no meas_id in event")
+                    continue
+
+                await collector.add_event(
+                    meas_id=meas_id,
+                    system_name=name,
+                    latency_ms=latency_ms,
+                    loc_info=loc_info,
+                    raw_event=event,
+                    debug=debug,
+                )
+                event_count += 1
+                continue
+
+            # Legacy mode: return on first match
             return {
                 "name": name,
                 "latency_ms": latency_ms,
                 "loc_info": loc_info,
             }
 
-    except asyncio.TimeoutError:
+        # Timeout reached
+        if collector is not None:
+            return {"name": name, "count": event_count}
         return {"name": name, "error": "timeout"}
+
     except Exception as e:
+        if collector is not None:
+            return {"name": name, "count": event_count, "error": str(e)}
         return {"name": name, "error": str(e)}
 
 
@@ -356,22 +505,34 @@ async def listen_zlp_for_location(
     system_id: str,
     t_trigger: float,
     timeout: float,
-    debug: bool
+    debug: bool,
+    collector: Optional[EventCollector] = None
 ) -> dict:
     """
     Listen on an already-connected ZLP Socket.IO client for location events.
 
-    Returns: {"name": "ZLP", "latency_ms": float, "loc_info": dict}
+    If collector is provided, collects ALL matching events until timeout.
+    Otherwise, returns on first match (legacy behavior).
+
+    Returns: {"name": "ZLP", "count": int} when collecting
+         or: {"name": "ZLP", "latency_ms": float, "loc_info": dict} (legacy single-event)
          or: {"name": "ZLP", "error": str}
     """
     target_device_id = system_id_to_uuid(system_id)
     result = {"name": "ZLP", "error": "timeout"}
     event_received = asyncio.Event()
+    event_count = [0]  # Use list for mutability in nested function
+    first_event_logged = [False]
 
     @sio.on("GET_NEW_LOCATION_HISTORY", namespace="/locations")
     async def on_location(data):
         nonlocal result
         t_event = time.perf_counter()
+
+        # Debug: log full structure of first event
+        if debug and not first_event_logged[0]:
+            print(f"  [ZLP] [first-event-structure] {json.dumps(data, indent=2, default=str)[:500]}")
+            first_event_logged[0] = True
 
         device_res_name = data.get("deviceResName", "")
 
@@ -379,33 +540,185 @@ async def listen_zlp_for_location(
             x_cm = data.get("x", 0)
             y_cm = data.get("y", 0)
             z_cm = data.get("z", 0)
-            print(f"  [ZLP] [event] deviceResName={device_res_name} loc=({x_cm/100:.1f}, {y_cm/100:.1f}, {z_cm/100:.1f})")
+            meas_id = extract_meas_id({}, "ZLP", zlp_data=data)
+            print(f"  [ZLP] [event] deviceResName={device_res_name} meas_id={meas_id} loc=({x_cm/100:.1f}, {y_cm/100:.1f}, {z_cm/100:.1f})")
 
         if device_res_name != target_device_id:
             return
 
         # Match found - extract location info (coordinates in cm, convert to m)
         latency_ms = (t_event - t_trigger) * 1000
+        loc_info = {
+            "x": data.get("x", 0) / 100.0,
+            "y": data.get("y", 0) / 100.0,
+            "z": data.get("z", 0) / 100.0,
+            "timestamp": data.get("locationTime", 0),
+            "published_timestamp": 0,
+            "node_id": device_res_name,
+        }
+
+        # Collection mode: add to collector
+        if collector is not None:
+            meas_id = extract_meas_id({}, "ZLP", zlp_data=data)
+            if meas_id is None:
+                if debug:
+                    print(f"  [ZLP] [skip] no meas_id in event")
+                return
+
+            await collector.add_event(
+                meas_id=meas_id,
+                system_name="ZLP",
+                latency_ms=latency_ms,
+                loc_info=loc_info,
+                raw_event=data,
+                debug=debug,
+            )
+            event_count[0] += 1
+            return
+
+        # Legacy mode: return on first match
         result = {
             "name": "ZLP",
             "latency_ms": latency_ms,
-            "loc_info": {
-                "x": data.get("x", 0) / 100.0,
-                "y": data.get("y", 0) / 100.0,
-                "z": data.get("z", 0) / 100.0,
-                "timestamp": data.get("locationTime", 0),
-                "published_timestamp": 0,
-                "node_id": device_res_name,
-            },
+            "loc_info": loc_info,
         }
         event_received.set()
 
+    # Collection mode: wait full timeout duration
+    if collector is not None:
+        await asyncio.sleep(timeout)
+        return {"name": "ZLP", "count": event_count[0]}
+
+    # Legacy mode: wait for first event or timeout
     try:
         await asyncio.wait_for(event_received.wait(), timeout=timeout)
     except asyncio.TimeoutError:
         result = {"name": "ZLP", "error": "timeout"}
 
     return result
+
+
+def format_results_table(
+    collector: EventCollector,
+    trigger_time: datetime,
+    timeout: float,
+    connected_systems: list[str]
+) -> str:
+    """
+    Format collected events as a correlation table.
+
+    Args:
+        collector: EventCollector with all collected events
+        trigger_time: UTC timestamp when locate was triggered
+        timeout: Timeout duration in seconds
+        connected_systems: List of system names that were connected (for column ordering)
+
+    Returns:
+        Formatted table string
+    """
+    results = collector.get_results()
+    lines = []
+
+    lines.append("-" * 60)
+    lines.append(f"Trigger time: {trigger_time.isoformat(timespec='milliseconds')}")
+    lines.append(f"Timeout: {timeout}s")
+    lines.append("")
+
+    if not results:
+        lines.append("No events received within timeout")
+        lines.append("-" * 60)
+        return "\n".join(lines)
+
+    # Determine columns based on connected systems (order: WiFi-Cloud, ILaaS, ZLP)
+    system_order = ["WiFi-Cloud", "ILaaS", "ZLP"]
+    columns = [s for s in system_order if s in connected_systems]
+
+    # Calculate column widths
+    meas_id_width = max(16, max(len(m) for m in results.keys()))
+    col_width = 12
+
+    # Header row
+    header = f"{'meas_id':<{meas_id_width}}"
+    for col in columns:
+        header += f" | {col:>{col_width}}"
+    lines.append(header)
+
+    # Separator
+    sep = "-" * meas_id_width
+    for _ in columns:
+        sep += "-+-" + "-" * col_width
+    lines.append(sep)
+
+    # Get WiFi-Cloud latencies for delta calculation
+    wifi_latencies = {}
+    for meas_id, system_events in results.items():
+        if "WiFi-Cloud" in system_events:
+            wifi_latencies[meas_id] = system_events["WiFi-Cloud"].latency_ms
+
+    # Sort meas_ids by WiFi-Cloud latency (or earliest arrival if WiFi-Cloud missing)
+    def sort_key(meas_id):
+        system_events = results[meas_id]
+        if "WiFi-Cloud" in system_events:
+            return system_events["WiFi-Cloud"].latency_ms
+        # Use earliest latency from any system
+        return min(e.latency_ms for e in system_events.values())
+
+    sorted_meas_ids = sorted(results.keys(), key=sort_key)
+
+    # Data rows
+    delta_sums: dict[str, float] = {col: 0.0 for col in columns}
+    delta_counts: dict[str, int] = {col: 0 for col in columns}
+
+    for meas_id in sorted_meas_ids:
+        system_events = results[meas_id]
+        row = f"{meas_id:<{meas_id_width}}"
+
+        for col in columns:
+            if col in system_events:
+                latency = system_events[col].latency_ms
+
+                # Calculate delta vs WiFi-Cloud
+                if col != "WiFi-Cloud" and meas_id in wifi_latencies:
+                    delta = latency - wifi_latencies[meas_id]
+                    delta_sums[col] += delta
+                    delta_counts[col] += 1
+                    cell = f"{latency:.1f}ms ({delta:+.0f})"
+                else:
+                    cell = f"{latency:.1f}ms"
+
+                row += f" | {cell:>{col_width}}"
+            else:
+                row += f" | {'-':>{col_width}}"
+
+        lines.append(row)
+
+    # Separator before summary
+    lines.append(sep)
+
+    # Summary row 1: Matched counts
+    total_meas_ids = len(results)
+    matched_row = f"{'Matched':<{meas_id_width}}"
+    for col in columns:
+        count = sum(1 for events in results.values() if col in events)
+        cell = f"{count}/{total_meas_ids}"
+        matched_row += f" | {cell:>{col_width}}"
+    lines.append(matched_row)
+
+    # Summary row 2: Average delta vs WiFi-Cloud
+    avg_delta_row = f"{'Avg delta vs WC':<{meas_id_width}}"
+    for col in columns:
+        if col == "WiFi-Cloud":
+            cell = "-"
+        elif delta_counts[col] > 0:
+            avg = delta_sums[col] / delta_counts[col]
+            cell = f"{avg:+.1f}ms"
+        else:
+            cell = "-"
+        avg_delta_row += f" | {cell:>{col_width}}"
+    lines.append(avg_delta_row)
+
+    lines.append("-" * 60)
+    return "\n".join(lines)
 
 
 async def main() -> int:
@@ -543,9 +856,12 @@ async def main() -> int:
 
         print(f"Waiting for location events (timeout: {timeout}s)...")
 
-        # Launch listeners concurrently
+        # Create event collector for meas_id correlation
+        collector = EventCollector()
+
+        # Launch listeners concurrently - all will collect events for full timeout
         tasks = [
-            listen_for_location(name, ws, system_id, t_trigger, timeout, debug)
+            listen_for_location(name, ws, system_id, t_trigger, timeout, debug, collector=collector)
             for name, ws in connections
         ]
 
@@ -557,60 +873,29 @@ async def main() -> int:
                 t_trigger=t_trigger,
                 timeout=timeout,
                 debug=debug,
+                collector=collector,
             ))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Process results
-        successful_results = []
-        failed_results = []
-
+        # Report any exceptions
         for result in results:
             if isinstance(result, Exception):
-                failed_results.append({"name": "unknown", "error": str(result)})
-            elif "error" in result:
-                failed_results.append(result)
-            else:
-                successful_results.append(result)
+                print(f"  Listener error: {result}")
+            elif "error" in result and result.get("count", 0) == 0:
+                print(f"  {result['name']}: {result['error']}")
 
-        # Format output
-        print("-" * 40)
-        print(f"Trigger time: {trigger_time_utc.isoformat(timespec='milliseconds')}")
-        print()
+        # Format and print the correlation table
+        table = format_results_table(
+            collector=collector,
+            trigger_time=trigger_time_utc,
+            timeout=timeout,
+            connected_systems=connected_names + (["ZLP"] if zlp_client else []),
+        )
+        print(table)
 
-        # Find WiFi-Cloud result for delta calculation
-        wifi_cloud_latency = None
-        for r in successful_results:
-            if r["name"] == "WiFi-Cloud":
-                wifi_cloud_latency = r["latency_ms"]
-                break
-
-        # Sort results: successful first (by name order: WiFi-Cloud, ILaaS, ZLP), then failed
-        name_order = {"WiFi-Cloud": 0, "ILaaS": 1, "ZLP": 2}
-        all_results = successful_results + failed_results
-        all_results.sort(key=lambda r: name_order.get(r["name"], 99))
-
-        for result in all_results:
-            name = result["name"]
-            if "error" in result:
-                print(f"{name + ':':13} {result['error']}")
-            else:
-                latency = result["latency_ms"]
-                loc = result["loc_info"]
-                loc_str = f"({loc['x']:.2f}, {loc['y']:.2f}, {loc['z']:.2f})"
-
-                if wifi_cloud_latency is not None and name != "WiFi-Cloud":
-                    delta = latency - wifi_cloud_latency
-                    delta_str = f"  ({delta:+.1f} vs WiFi-Cloud)"
-                else:
-                    delta_str = ""
-
-                print(f"{name + ':':13} {latency:7.1f} ms  @ {loc_str}{delta_str}")
-
-        print("-" * 40)
-
-        # Exit 0 if at least one succeeded, exit 1 if all failed
-        return 0 if successful_results else 1
+        # Exit 0 if any events collected, exit 1 if none
+        return 0 if collector.get_results() else 1
 
     finally:
         # Close all websocket connections
