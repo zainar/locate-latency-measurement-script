@@ -172,6 +172,7 @@ ZLP:          timeout
 - Each system shows its own location (coordinates may differ between systems)
 - Delta shown vs WiFi-Cloud when available
 - "timeout" or error message for failed listeners
+- The per-trigger report header shows event counts broken down by system (e.g., `Events collected: WiFi-Cloud: 10, ILaaS: 10, ZLP: 10`) rather than a single total
 
 ## Other Scripts
 

@@ -1,0 +1,2 @@
+trigger_index,trigger_time,api_response_time_ms,meas_id,wifi_cloud_latency_ms,ilaas_latency_ms,zlp_latency_ms
+1,2026-02-09T20:45:32.067+00:00,138.1,0000019c441ab769,19859.8,,
