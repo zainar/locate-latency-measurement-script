@@ -88,6 +88,7 @@ Avg delta vs WC    |            - |    +4672.2ms |     +645.5ms
 ------------------------------------------------------------
 ```
 
+- **Events collected**: Per-system counts shown in report header (e.g., `WiFi-Cloud: 10, ILaaS: 10, ZLP: 10`)
 - **Matched**: Events with this system present / total unique meas_ids
 - **Avg delta vs WC**: Average latency difference vs WiFi-Cloud (baseline)
 - Rows sorted by WiFi-Cloud latency (or earliest arrival if WiFi-Cloud missing)

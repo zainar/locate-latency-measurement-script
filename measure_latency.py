@@ -30,6 +30,7 @@ Example:
 
 import argparse
 import asyncio
+import csv
 import json
 import time
 from dataclasses import dataclass
@@ -45,11 +46,22 @@ from rest_client import Rest, Config
 
 
 @dataclass
+class Trigger:
+    """A single locate API trigger."""
+    index: int                      # 1-indexed trigger number
+    timestamp_utc: datetime         # Wall-clock time when API call was initiated
+    perf_time: float                # time.perf_counter() at API call initiation
+    api_response_time_ms: float     # How long the POST took
+    action_id: str = ""             # From API response (diagnostics)
+
+
+@dataclass
 class CollectedEvent:
     """A single location event collected from a WebSocket."""
     meas_id: str
     system_name: str
-    latency_ms: float
+    arrival_time_utc: datetime      # Wall-clock time when event arrived
+    arrival_perf_time: float        # time.perf_counter() when event arrived
     loc_info: dict
     raw_event: dict
 
@@ -59,6 +71,7 @@ class EventCollector:
 
     def __init__(self):
         self._events: dict[str, dict[str, CollectedEvent]] = {}  # meas_id -> {system_name -> event}
+        self._all_events: list[CollectedEvent] = []  # flat list for trigger assignment
         self._lock = asyncio.Lock()
         self._counts: dict[str, int] = {}  # system_name -> total events seen
 
@@ -66,7 +79,8 @@ class EventCollector:
         self,
         meas_id: str,
         system_name: str,
-        latency_ms: float,
+        arrival_time_utc: datetime,
+        arrival_perf_time: float,
         loc_info: dict,
         raw_event: dict,
         debug: bool = False
@@ -88,18 +102,25 @@ class EventCollector:
                     print(f"  [{system_name}] [skip] duplicate meas_id={meas_id}")
                 return False
 
-            self._events[meas_id][system_name] = CollectedEvent(
+            event = CollectedEvent(
                 meas_id=meas_id,
                 system_name=system_name,
-                latency_ms=latency_ms,
+                arrival_time_utc=arrival_time_utc,
+                arrival_perf_time=arrival_perf_time,
                 loc_info=loc_info,
                 raw_event=raw_event,
             )
+            self._events[meas_id][system_name] = event
+            self._all_events.append(event)
             return True
 
     def get_results(self) -> dict[str, dict[str, CollectedEvent]]:
         """Return all collected events grouped by meas_id."""
         return self._events
+
+    def get_all_events(self) -> list[CollectedEvent]:
+        """Return flat list of all collected events (for trigger assignment)."""
+        return self._all_events
 
     def get_event_counts(self) -> dict[str, int]:
         """Return total event count per system."""
@@ -190,21 +211,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--zlp-url", help="ZLP Socket.IO URL (e.g., wss://zps-web-api.zlp-dev.zainar.net)")
     parser.add_argument("--zlp-token", help="ZLP JWT token (from __session cookie)")
     parser.add_argument("--zlp-account", help="ZLP account resource name")
-    parser.add_argument("--repeat-count", type=int, default=0, help="Number of additional locates for server to perform (default: 0)")
-    parser.add_argument("--interval", type=int, default=2000, help="Interval between locates in ms (default: 2000, range: 500-10000)")
-    parser.add_argument("--timeout", type=float, default=30.0, help="Timeout waiting for event (seconds)")
+    parser.add_argument("--interval", type=float, default=3.0, help="Seconds between Locate API triggers (default: 3.0)")
+    parser.add_argument("--timeout", type=float, default=30.0, help="How long the test runs in seconds (default: 30.0)")
     parser.add_argument("--debug", action="store_true", help="Print all received messages")
+    parser.add_argument("--output-format", choices=["console", "csv", "both"], default="both", help="Output format: console, csv, or both (default: both)")
     return parser
 
 
-async def trigger_locate(rest_client: Rest, system_id: str, api_node_type: str,
-                         repeat_count: int = 0, interval_ms: int = 2000) -> dict:
-    """Trigger a locate via REST API and return the response."""
+async def trigger_locate(rest_client: Rest, system_id: str, api_node_type: str) -> dict:
+    """Trigger a single locate via REST API and return the response."""
     payload = {
         api_node_type: {
             "locate": {
-                "repeat_count": repeat_count,
-                "backoff": interval_ms,
+                "repeat_count": 0,
+                "backoff": 2000,
             }
         },
         "tags": {
@@ -375,6 +395,7 @@ async def listen_for_location(
                 break
 
             t_event = time.perf_counter()
+            t_event_utc = datetime.now(timezone.utc)
 
             try:
                 event = json.loads(raw_message)
@@ -410,8 +431,6 @@ async def listen_for_location(
             if match_id != system_id:
                 continue
 
-            latency_ms = (t_event - t_trigger) * 1000
-
             # Collection mode: add to collector and continue
             if collector is not None:
                 meas_id = extract_meas_id(event, name)
@@ -423,7 +442,8 @@ async def listen_for_location(
                 await collector.add_event(
                     meas_id=meas_id,
                     system_name=name,
-                    latency_ms=latency_ms,
+                    arrival_time_utc=t_event_utc,
+                    arrival_perf_time=t_event,
                     loc_info=loc_info,
                     raw_event=event,
                     debug=debug,
@@ -432,6 +452,7 @@ async def listen_for_location(
                 continue
 
             # Legacy mode: return on first match
+            latency_ms = (t_event - t_trigger) * 1000
             return {
                 "name": name,
                 "latency_ms": latency_ms,
@@ -528,6 +549,7 @@ async def listen_zlp_for_location(
     async def on_location(data):
         nonlocal result
         t_event = time.perf_counter()
+        t_event_utc = datetime.now(timezone.utc)
 
         # Debug: log full structure of first event
         if debug and not first_event_logged[0]:
@@ -547,7 +569,6 @@ async def listen_zlp_for_location(
             return
 
         # Match found - extract location info (coordinates in cm, convert to m)
-        latency_ms = (t_event - t_trigger) * 1000
         loc_info = {
             "x": data.get("x", 0) / 100.0,
             "y": data.get("y", 0) / 100.0,
@@ -568,7 +589,8 @@ async def listen_zlp_for_location(
             await collector.add_event(
                 meas_id=meas_id,
                 system_name="ZLP",
-                latency_ms=latency_ms,
+                arrival_time_utc=t_event_utc,
+                arrival_perf_time=t_event,
                 loc_info=loc_info,
                 raw_event=data,
                 debug=debug,
@@ -577,6 +599,7 @@ async def listen_zlp_for_location(
             return
 
         # Legacy mode: return on first match
+        latency_ms = (t_event - t_trigger) * 1000
         result = {
             "name": "ZLP",
             "latency_ms": latency_ms,
@@ -598,127 +621,276 @@ async def listen_zlp_for_location(
     return result
 
 
-def format_results_table(
-    collector: EventCollector,
-    trigger_time: datetime,
-    timeout: float,
-    connected_systems: list[str]
+async def trigger_loop(
+    rest_client: Rest,
+    system_id: str,
+    api_node_type: str,
+    num_triggers: int,
+    trigger_interval: float,
+    debug: bool = False,
+) -> list[Trigger]:
+    """Fire N locate triggers at a configurable interval, returning Trigger metadata."""
+    triggers: list[Trigger] = []
+    for i in range(1, num_triggers + 1):
+        t0 = time.perf_counter()
+        t0_utc = datetime.now(timezone.utc)
+        response = await trigger_locate(rest_client, system_id, api_node_type)
+        api_rt_ms = (time.perf_counter() - t0) * 1000
+
+        action_id = ""
+        if isinstance(response, dict):
+            action_id = response.get("action_id", "")
+
+        trigger = Trigger(
+            index=i,
+            timestamp_utc=t0_utc,
+            perf_time=t0,
+            api_response_time_ms=api_rt_ms,
+            action_id=action_id,
+        )
+        triggers.append(trigger)
+        print(f"  Trigger {i}/{num_triggers} sent (api_rt={api_rt_ms:.0f}ms, action_id={action_id})")
+
+        # Sleep between triggers (except after last)
+        if i < num_triggers:
+            sleep_time = trigger_interval - (api_rt_ms / 1000)
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
+
+    return triggers
+
+
+def assign_events_to_triggers(
+    events: list[CollectedEvent],
+    triggers: list[Trigger],
+) -> dict[int, list[tuple[CollectedEvent, float]]]:
+    """
+    Assign each event to its most recent preceding trigger.
+
+    Returns: {trigger_index: [(event, latency_ms), ...]} sorted by arrival time within each group.
+    Events arriving before the first trigger are discarded.
+    """
+    if not triggers:
+        return {}
+
+    # Sort triggers by perf_time (should already be sorted, but be safe)
+    sorted_triggers = sorted(triggers, key=lambda t: t.perf_time)
+
+    result: dict[int, list[tuple[CollectedEvent, float]]] = {t.index: [] for t in sorted_triggers}
+
+    for event in events:
+        # Find the most recent trigger before this event
+        assigned_trigger = None
+        for trigger in reversed(sorted_triggers):
+            if trigger.perf_time <= event.arrival_perf_time:
+                assigned_trigger = trigger
+                break
+
+        if assigned_trigger is None:
+            # Event arrived before first trigger - discard
+            continue
+
+        latency_ms = (event.arrival_perf_time - assigned_trigger.perf_time) * 1000
+        result[assigned_trigger.index].append((event, latency_ms))
+
+    # Sort each group by arrival time
+    for idx in result:
+        result[idx].sort(key=lambda pair: pair[0].arrival_perf_time)
+
+    return result
+
+
+def format_trigger_results_table(
+    triggers: list[Trigger],
+    assigned: dict[int, list[tuple[CollectedEvent, float]]],
+    system_id: str,
+    trigger_interval: float,
+    connected_systems: list[str],
 ) -> str:
-    """
-    Format collected events as a correlation table.
-
-    Args:
-        collector: EventCollector with all collected events
-        trigger_time: UTC timestamp when locate was triggered
-        timeout: Timeout duration in seconds
-        connected_systems: List of system names that were connected (for column ordering)
-
-    Returns:
-        Formatted table string
-    """
-    results = collector.get_results()
+    """Format per-trigger results as a console table with inter-event gap tracking."""
     lines = []
-
-    lines.append("-" * 60)
-    lines.append(f"Trigger time: {trigger_time.isoformat(timespec='milliseconds')}")
-    lines.append(f"Timeout: {timeout}s")
-    lines.append("")
-
-    if not results:
-        lines.append("No events received within timeout")
-        lines.append("-" * 60)
-        return "\n".join(lines)
-
-    # Determine columns based on connected systems (order: WiFi-Cloud, ILaaS, ZLP)
     system_order = ["WiFi-Cloud", "ILaaS", "ZLP"]
     columns = [s for s in system_order if s in connected_systems]
 
-    # Calculate column widths
-    meas_id_width = max(16, max(len(m) for m in results.keys()))
-    col_width = 12
+    events_per_system: dict[str, int] = {col: 0 for col in columns}
+    for evts in assigned.values():
+        for event, _ in evts:
+            if event.system_name in events_per_system:
+                events_per_system[event.system_name] += 1
+    events_summary = ", ".join(f"{name}: {count}" for name, count in events_per_system.items())
+    lines.append("=" * 80)
+    lines.append(f"Per-Trigger Latency Report")
+    lines.append(f"  System ID: {system_id}")
+    lines.append(f"  Triggers: {len(triggers)}, interval: {trigger_interval}s")
+    lines.append(f"  Events collected: {events_summary}")
+    lines.append("=" * 80)
 
-    # Header row
-    header = f"{'meas_id':<{meas_id_width}}"
+    # Column widths — wider to accommodate gap info
+    trig_w = 9   # "Trigger N"
+    time_w = 15  # trigger time
+    meas_w = 18  # meas_id
+    lat_w = 22   # latency column (e.g. "1234.5ms (gap 3.1s)")
+
+    # Header
+    header = f"{'trigger':<{trig_w}} | {'trigger_time':<{time_w}} | {'meas_id':<{meas_w}}"
     for col in columns:
-        header += f" | {col:>{col_width}}"
+        header += f" | {col:>{lat_w}}"
     lines.append(header)
 
-    # Separator
-    sep = "-" * meas_id_width
+    sep = "-" * trig_w + "-+-" + "-" * time_w + "-+-" + "-" * meas_w
     for _ in columns:
-        sep += "-+-" + "-" * col_width
+        sep += "-+-" + "-" * lat_w
     lines.append(sep)
 
-    # Get WiFi-Cloud latencies for delta calculation
-    wifi_latencies = {}
-    for meas_id, system_events in results.items():
-        if "WiFi-Cloud" in system_events:
-            wifi_latencies[meas_id] = system_events["WiFi-Cloud"].latency_ms
+    # Track last arrival perf_time per system for gap calculation
+    last_arrival_perf: dict[str, float] = {}
+    # Collect all gaps per system for summary
+    all_gaps: dict[str, list[float]] = {col: [] for col in columns}
 
-    # Sort meas_ids by WiFi-Cloud latency (or earliest arrival if WiFi-Cloud missing)
-    def sort_key(meas_id):
-        system_events = results[meas_id]
-        if "WiFi-Cloud" in system_events:
-            return system_events["WiFi-Cloud"].latency_ms
-        # Use earliest latency from any system
-        return min(e.latency_ms for e in system_events.values())
+    for trigger in triggers:
+        trigger_events = assigned.get(trigger.index, [])
+        trigger_label = f"#{trigger.index}"
+        trigger_time_str = trigger.timestamp_utc.strftime("%H:%M:%S.%f")[:-3]
 
-    sorted_meas_ids = sorted(results.keys(), key=sort_key)
+        if not trigger_events:
+            row = f"{trigger_label:<{trig_w}} | {trigger_time_str:<{time_w}} | {'(no events)':<{meas_w}}"
+            for _ in columns:
+                row += f" | {'-':>{lat_w}}"
+            lines.append(row)
+            continue
 
-    # Data rows
-    delta_sums: dict[str, float] = {col: 0.0 for col in columns}
-    delta_counts: dict[str, int] = {col: 0 for col in columns}
+        # Group events by meas_id, preserving per-event data for gap tracking
+        meas_groups: dict[str, dict[str, tuple[float, CollectedEvent]]] = {}
+        for event, latency_ms in trigger_events:
+            if event.meas_id not in meas_groups:
+                meas_groups[event.meas_id] = {}
+            meas_groups[event.meas_id][event.system_name] = (latency_ms, event)
 
-    for meas_id in sorted_meas_ids:
-        system_events = results[meas_id]
-        row = f"{meas_id:<{meas_id_width}}"
-
-        for col in columns:
-            if col in system_events:
-                latency = system_events[col].latency_ms
-
-                # Calculate delta vs WiFi-Cloud
-                if col != "WiFi-Cloud" and meas_id in wifi_latencies:
-                    delta = latency - wifi_latencies[meas_id]
-                    delta_sums[col] += delta
-                    delta_counts[col] += 1
-                    cell = f"{latency:.1f}ms ({delta:+.0f})"
-                else:
-                    cell = f"{latency:.1f}ms"
-
-                row += f" | {cell:>{col_width}}"
+        first_row = True
+        for meas_id, sys_data in meas_groups.items():
+            if first_row:
+                trig_cell = f"{trigger_label:<{trig_w}}"
+                time_cell = f"{trigger_time_str:<{time_w}}"
+                first_row = False
             else:
-                row += f" | {'-':>{col_width}}"
+                trig_cell = f"{'':<{trig_w}}"
+                time_cell = f"{'':<{time_w}}"
 
-        lines.append(row)
+            row = f"{trig_cell} | {time_cell} | {meas_id:<{meas_w}}"
+            for col in columns:
+                if col in sys_data:
+                    latency_ms, event = sys_data[col]
+                    if col in last_arrival_perf:
+                        gap_s = event.arrival_perf_time - last_arrival_perf[col]
+                        all_gaps[col].append(gap_s)
+                        cell = f"{latency_ms:.0f}ms (gap {gap_s:.1f}s)"
+                    else:
+                        cell = f"{latency_ms:.0f}ms"
+                    last_arrival_perf[col] = event.arrival_perf_time
+                else:
+                    cell = "-"
+                row += f" | {cell:>{lat_w}}"
+            lines.append(row)
 
-    # Separator before summary
     lines.append(sep)
 
-    # Summary row 1: Matched counts
-    total_meas_ids = len(results)
-    matched_row = f"{'Matched':<{meas_id_width}}"
-    for col in columns:
-        count = sum(1 for events in results.values() if col in events)
-        cell = f"{count}/{total_meas_ids}"
-        matched_row += f" | {cell:>{col_width}}"
-    lines.append(matched_row)
+    # Summary: events per trigger
+    total_events = sum(events_per_system.values())
+    avg_events = total_events / len(triggers) if triggers else 0
+    lines.append(f"Average events/trigger: {avg_events:.1f}")
 
-    # Summary row 2: Average delta vs WiFi-Cloud
-    avg_delta_row = f"{'Avg delta vs WC':<{meas_id_width}}"
+    # Per-system average latency across all triggers
     for col in columns:
-        if col == "WiFi-Cloud":
-            cell = "-"
-        elif delta_counts[col] > 0:
-            avg = delta_sums[col] / delta_counts[col]
-            cell = f"{avg:+.1f}ms"
-        else:
-            cell = "-"
-        avg_delta_row += f" | {cell:>{col_width}}"
-    lines.append(avg_delta_row)
+        all_latencies = []
+        for evts in assigned.values():
+            for event, latency_ms in evts:
+                if event.system_name == col:
+                    all_latencies.append(latency_ms)
+        if all_latencies:
+            avg = sum(all_latencies) / len(all_latencies)
+            lines.append(f"  {col} avg latency: {avg:.1f}ms (n={len(all_latencies)})")
 
-    lines.append("-" * 60)
+    # Per-system average inter-event gap
+    for col in columns:
+        if all_gaps[col]:
+            avg_gap = sum(all_gaps[col]) / len(all_gaps[col])
+            lines.append(f"  {col} avg inter-event gap: {avg_gap:.1f}s (n={len(all_gaps[col])})")
+
+    lines.append("=" * 80)
     return "\n".join(lines)
+
+
+def write_trigger_results_csv(
+    triggers: list[Trigger],
+    assigned: dict[int, list[tuple[CollectedEvent, float]]],
+    system_id: str,
+) -> str:
+    """
+    Write per-trigger results to a CSV file with inter-event gap columns.
+
+    Returns the filename written.
+    """
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"latency_per_trigger_{system_id}_{timestamp_str}.csv"
+    filepath = Path(__file__).resolve().parent / filename
+
+    # Track last arrival perf_time per system for gap calculation
+    last_arrival_perf: dict[str, float] = {}
+
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "trigger_index", "trigger_time", "api_response_time_ms",
+            "meas_id", "wifi_cloud_latency_ms", "ilaas_latency_ms", "zlp_latency_ms",
+            "wifi_cloud_gap_s", "ilaas_gap_s", "zlp_gap_s",
+        ])
+
+        for trigger in triggers:
+            trigger_events = assigned.get(trigger.index, [])
+            trigger_time_str = trigger.timestamp_utc.isoformat(timespec="milliseconds")
+
+            if not trigger_events:
+                writer.writerow([
+                    trigger.index, trigger_time_str, f"{trigger.api_response_time_ms:.1f}",
+                    "", "", "", "", "", "", "",
+                ])
+                continue
+
+            # Group events by meas_id, preserving event objects for gap tracking
+            meas_groups: dict[str, dict[str, tuple[float, CollectedEvent]]] = {}
+            for event, latency_ms in trigger_events:
+                if event.meas_id not in meas_groups:
+                    meas_groups[event.meas_id] = {}
+                meas_groups[event.meas_id][event.system_name] = (latency_ms, event)
+
+            for meas_id, sys_data in meas_groups.items():
+                gaps: dict[str, str] = {}
+                for sys_name in ("WiFi-Cloud", "ILaaS", "ZLP"):
+                    if sys_name in sys_data:
+                        _, event = sys_data[sys_name]
+                        if sys_name in last_arrival_perf:
+                            gap_s = event.arrival_perf_time - last_arrival_perf[sys_name]
+                            gaps[sys_name] = f"{gap_s:.2f}"
+                        else:
+                            gaps[sys_name] = ""
+                        last_arrival_perf[sys_name] = event.arrival_perf_time
+                    else:
+                        gaps[sys_name] = ""
+
+                writer.writerow([
+                    trigger.index,
+                    trigger_time_str,
+                    f"{trigger.api_response_time_ms:.1f}",
+                    meas_id,
+                    f"{sys_data['WiFi-Cloud'][0]:.1f}" if "WiFi-Cloud" in sys_data else "",
+                    f"{sys_data['ILaaS'][0]:.1f}" if "ILaaS" in sys_data else "",
+                    f"{sys_data['ZLP'][0]:.1f}" if "ZLP" in sys_data else "",
+                    gaps["WiFi-Cloud"],
+                    gaps["ILaaS"],
+                    gaps["ZLP"],
+                ])
+
+    return str(filepath)
 
 
 async def main() -> int:
@@ -728,10 +900,14 @@ async def main() -> int:
     env = args.env
     system_id = args.system_id
     node_type = args.node_type
-    repeat_count = args.repeat_count
-    interval_ms = args.interval
+    interval = args.interval
     timeout = args.timeout
     debug = args.debug
+    output_format = args.output_format
+
+    # Auto-compute trigger count and interval from --interval and --timeout
+    num_triggers = max(1, int(timeout // interval))
+    trigger_interval = interval
 
     # Build websocket list from provided URLs (plain websocket connections)
     websocket_configs = []
@@ -838,64 +1014,76 @@ async def main() -> int:
         print("Error: No websocket connections established")
         return 1
 
+    connected_systems = connected_names + (["ZLP"] if zlp_client else [])
+
     try:
-        total_locates = 1 + repeat_count
-        print(f"Triggering locate for {node_type}: {system_id} ({total_locates} locate(s), {interval_ms}ms interval)")
+        print(f"Triggering locate every {interval}s for {timeout}s ({num_triggers} triggers)")
 
-        # Record trigger time and send request
-        t_trigger = time.perf_counter()
-        trigger_time_utc = datetime.now(timezone.utc)
-        response = await trigger_locate(rest_client, system_id, api_node_type, repeat_count, interval_ms)
-
-        if isinstance(response, dict) and response.get("error"):
-            print(f"  API error: {response}")
-            return 1
-
-        action_id = response.get("action_id", "")
-        print(f"  API response: OK (action_id: {action_id})")
-
-        print(f"Waiting for location events (timeout: {timeout}s)...")
-
-        # Create event collector for meas_id correlation
         collector = EventCollector()
 
-        # Launch listeners concurrently - all will collect events for full timeout
-        tasks = [
-            listen_for_location(name, ws, system_id, t_trigger, timeout, debug, collector=collector)
+        # Listeners run for the full test duration
+        listener_tasks = [
+            listen_for_location(name, ws, system_id, 0.0, timeout, debug, collector=collector)
             for name, ws in connections
         ]
-
-        # ZLP uses Socket.IO, add its listener task separately
         if zlp_client:
-            tasks.append(listen_zlp_for_location(
-                sio=zlp_client,
-                system_id=system_id,
-                t_trigger=t_trigger,
-                timeout=timeout,
-                debug=debug,
-                collector=collector,
+            listener_tasks.append(listen_zlp_for_location(
+                sio=zlp_client, system_id=system_id, t_trigger=0.0,
+                timeout=timeout, debug=debug, collector=collector,
             ))
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Build trigger loop task
+        trigger_task = trigger_loop(
+            rest_client=rest_client,
+            system_id=system_id,
+            api_node_type=api_node_type,
+            num_triggers=num_triggers,
+            trigger_interval=trigger_interval,
+            debug=debug,
+        )
 
-        # Report any exceptions
-        for result in results:
+        # Run listeners and trigger loop concurrently
+        all_results = await asyncio.gather(*listener_tasks, trigger_task, return_exceptions=True)
+
+        # Last result is from trigger_loop
+        trigger_result = all_results[-1]
+        listener_results = all_results[:-1]
+
+        # Report listener exceptions
+        for result in listener_results:
             if isinstance(result, Exception):
                 print(f"  Listener error: {result}")
-            elif "error" in result and result.get("count", 0) == 0:
+            elif isinstance(result, dict) and "error" in result and result.get("count", 0) == 0:
                 print(f"  {result['name']}: {result['error']}")
 
-        # Format and print the correlation table
-        table = format_results_table(
-            collector=collector,
-            trigger_time=trigger_time_utc,
-            timeout=timeout,
-            connected_systems=connected_names + (["ZLP"] if zlp_client else []),
-        )
-        print(table)
+        if isinstance(trigger_result, Exception):
+            print(f"  Trigger loop error: {trigger_result}")
+            return 1
 
-        # Exit 0 if any events collected, exit 1 if none
-        return 0 if collector.get_results() else 1
+        triggers = trigger_result
+        events = collector.get_all_events()
+        assigned = assign_events_to_triggers(events, triggers)
+
+        # Output results
+        if output_format in ("console", "both"):
+            table = format_trigger_results_table(
+                triggers=triggers,
+                assigned=assigned,
+                system_id=system_id,
+                trigger_interval=trigger_interval,
+                connected_systems=connected_systems,
+            )
+            print(table)
+
+        if output_format in ("csv", "both"):
+            csv_path = write_trigger_results_csv(
+                triggers=triggers,
+                assigned=assigned,
+                system_id=system_id,
+            )
+            print(f"CSV written to: {csv_path}")
+
+        return 0 if events else 1
 
     finally:
         # Close all websocket connections
